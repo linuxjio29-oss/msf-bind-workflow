@@ -80,6 +80,8 @@ jobs:
           esac
 
           NAME=$(echo "$PAYLOAD" | tr '/' '_')
+          SAFE_NAME=$(echo "$PAYLOAD" | tr '/' '-' | tr -d ' :"<>|*?\')
+          echo "SAFE_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
           OUT="out/${NAME}.${EXT}"
 
           ARGS=(-p "$PAYLOAD")
@@ -140,7 +142,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.payload || 'payload' }}-${{ github.run_number }}
+          name: ${{ env.SAFE_NAME }}-${{ github.run_number }}
           path: out/
           if-no-files-found: error
           retention-days: 7
